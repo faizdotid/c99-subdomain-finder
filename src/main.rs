@@ -30,8 +30,8 @@ struct Args {
     input: PathBuf,
 }
 
+#[allow(unused)]
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 struct C99SubdomainResponse {
     success: bool,
     count: i32,
@@ -47,32 +47,28 @@ struct C99SubdomainFinder {
     output: Arc<Mutex<File>>,
 }
 
-impl Clone for C99SubdomainFinder {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            apikey: self.apikey.clone(),
-            output: self.output.clone(),
-        }
+impl Drop for C99SubdomainFinder {
+    fn drop(&mut self) {
+        println!("Cleaning up C99SubdomainFinder resources");
     }
 }
 
 impl C99SubdomainFinder {
-    async fn new(apikey: String, output: PathBuf) -> Result<Self, Box<dyn Error>> {
+    async fn new(apikey: String, output: PathBuf) -> Result<Box<Self>, Box<dyn Error>> {
         let client = Client::builder()
             .user_agent("C99SubdomainFinder/1.0")
             .build()?;
 
         let output = File::create(output).await?;
 
-        Ok(Self {
+        Ok(Box::new(Self {
             client,
             apikey,
             output: Arc::new(Mutex::new(output)),
-        })
+        }))
     }
 
-    async fn scan(&self, domain: &str) -> Result<(), Box<dyn Error>> {
+    async fn scan(&self, domain: String) -> Result<(), Box<dyn Error>> {
         let url = format!(
             "https://worker.vktools.com/api/subdomainfinder.php?key={}&domain={}",
             self.apikey, domain
@@ -113,26 +109,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     let finder = Arc::new(C99SubdomainFinder::new(args.apikey, args.output).await?);
-
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
-    let domains = tokio::fs::read_to_string(args.input).await?;
 
-    let mut tasks = vec![];
+    let domains: Vec<String> = tokio::fs::read_to_string(args.input)
+        .await?
+        .lines()
+        .map(String::from)
+        .collect();
 
-    for domain in domains.lines() {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let finder = finder.clone();
-        let domain = domain.to_string();
+    let tasks: Vec<_> = domains
+        .into_iter()
+        .map(|domain| {
+            let permit = semaphore.clone().acquire_owned();
+            let finder = finder.clone();
 
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = finder.scan(&domain).await {
-                eprintln!("Error scanning {}: {}", domain, e);
-            }
-        });
-
-        tasks.push(task);
-    }
+            tokio::spawn(async move {
+                let _permit = permit.await.unwrap();
+                if let Err(e) = finder.scan(domain.clone()).await {
+                    eprintln!("Error scanning {}: {}", domain, e);
+                }
+            })
+        })
+        .collect();
 
     for task in tasks {
         task.await.map_err(|e| e.to_string())?;
